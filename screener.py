@@ -218,8 +218,8 @@ def compute_operating_metrics(price: float, shares: float | None, current_assets
                               dsu: float | None = None, exchangeable: float | None = None) -> dict:
     """Steps 1-10. Missing inputs give NaN for the values that depend on them.
 
-    Percentages are NaN when Paid for Operating Property is <= 0 (current assets exceed the
-    price of the whole company), since dividing by it would flip the sign of the result.
+    A negative Paid for Operating Property (current assets exceed the price of the whole
+    company) is carried through with its sign; only an exact zero gives NaN percentages.
     """
     nan = float("nan")
     f = lambda x: nan if x is None else float(x)  # noqa: E731
@@ -230,8 +230,8 @@ def compute_operating_metrics(price: float, shares: float | None, current_assets
     eba = f(net_income) + f(da)
     balance = eba - CURRENT_ASSET_CHARGE * f(current_assets)
     life = f(net_ppe) / f(da) if da and net_ppe and da > 0 and net_ppe > 0 else nan
-    valid_base = paid_op > 0
-    inv_amort = paid_op / life if valid_base and life > 0 else nan
+    valid_base = paid_op != 0 and not math.isnan(paid_op)
+    inv_amort = paid_op / life if life > 0 else nan
     after = balance - inv_amort
     return {
         "available_shares": available,

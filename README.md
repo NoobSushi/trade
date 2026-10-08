@@ -33,7 +33,7 @@ Inputs:
 - **RSU/PSU:** nonvested non-option awards, from SEC XBRL (`...EquityInstrumentsOtherThanOptionsNonvestedNumber`). This is one combined figure, because SEC's company-level data doesn't break RSUs and PSUs out separately.
 - **DSUs and exchangeable shares:** there's no standard XBRL tag for these, so they're counted as 0. Unvested DSUs are usually already included in the RSU/PSU figure.
 
-When an input is missing, the values that depend on it show `n/a`, and the `Notes` column says why. If current assets exceed what the whole company costs (Paid for Operating Property ≤ 0), both percentages show `n/a`.
+When an input is missing, the values that depend on it show `n/a`, and the `Notes` column says why. If current assets exceed what the whole company costs, Paid for Operating Property is negative. It's shown with a minus sign and used as-is in steps 6–10, so the percentages can be negative too. Only an exact zero gives `n/a`, because that would be a division by zero.
 
 ## Data sources
 

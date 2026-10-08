@@ -108,9 +108,19 @@ def test_operating_metrics_follow_the_10_steps():
     assert m["pct_after"] == pytest.approx(7.5)           # 600 / 8000
 
 
-def test_operating_metrics_handle_missing_and_negative_base():
+def test_operating_metrics_keep_sign_when_paid_for_operating_property_is_negative():
     m = compute_operating_metrics(price=10.0, shares=100, current_assets=2_000, net_income=100, da=50, net_ppe=500)
-    assert m["paid_op"] == -1_000 and math.isnan(m["pct_before"]) and math.isnan(m["pct_after"])
+    assert m["paid_op"] == -1_000                         # 1000 - 2000
+    assert m["balance"] == 50                             # 150 - 100
+    assert m["pct_before"] == pytest.approx(-5.0)         # 50 / -1000
+    assert m["inv_amort"] == pytest.approx(-100)          # -1000 / 10
+    assert m["after"] == pytest.approx(150)               # 50 - (-100)
+    assert m["pct_after"] == pytest.approx(-15.0)         # 150 / -1000
+
+
+def test_operating_metrics_handle_missing_and_zero_base():
+    m = compute_operating_metrics(price=10.0, shares=200, current_assets=2_000, net_income=100, da=50, net_ppe=500)
+    assert m["paid_op"] == 0 and math.isnan(m["pct_before"]) and math.isnan(m["pct_after"])
     m = compute_operating_metrics(price=10.0, shares=1_000, current_assets=2_000, net_income=100, da=None,
                                   net_ppe=500)
     assert m["paid_op"] == 8_000 and math.isnan(m["pct_before"]) and math.isnan(m["est_life"])
