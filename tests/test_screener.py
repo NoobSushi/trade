@@ -1,10 +1,11 @@
+import math
 from datetime import date
 
 import pandas as pd
 import pytest
 
 import screener
-from screener import Criteria, evaluate_earnings, get_annual_eps
+from screener import Criteria, compute_operating_metrics, evaluate_earnings, get_annual_eps
 
 TODAY = date(2026, 10, 2)
 
@@ -16,26 +17,22 @@ def income_stmt(values: dict, row="Diluted EPS", start=2021):
     return df[cols[::-1]]
 
 
-class FakeTicker:
-    def __init__(self, stmt):
-        self.income_stmt = stmt
-
-
 def eps_series(vals, start=2021):
     return pd.Series(vals, index=[date(y, 12, 31) for y in range(start, start + len(vals))], dtype=float)
 
 
 def test_get_annual_eps_sorts_oldest_first_and_drops_nan():
     stmt = income_stmt({"Diluted EPS": [float("nan"), 2.0, 3.0, 4.0, 5.0], "Net Income": [1, 2, 3, 4, 5]})
-    eps = get_annual_eps(FakeTicker(stmt))
+    eps = get_annual_eps(stmt)
     assert list(eps.index) == [date(2022, 12, 31), date(2023, 12, 31), date(2024, 12, 31), date(2025, 12, 31)]
     assert eps.tolist() == [2.0, 3.0, 4.0, 5.0]
 
 
 def test_get_annual_eps_falls_back_to_basic_and_handles_empty():
-    assert get_annual_eps(FakeTicker(income_stmt({"Basic EPS": [1.0, 2.0]}))).tolist() == [1.0, 2.0]
-    assert get_annual_eps(FakeTicker(pd.DataFrame())).empty
-    assert get_annual_eps(FakeTicker(income_stmt({"Net Income": [1.0]}))).empty
+    assert get_annual_eps(income_stmt({"Basic EPS": [1.0, 2.0]})).tolist() == [1.0, 2.0]
+    assert get_annual_eps(pd.DataFrame()).empty
+    assert get_annual_eps(None).empty
+    assert get_annual_eps(income_stmt({"Net Income": [1.0]})).empty
 
 
 def test_evaluate_averages_up_to_5_years():
@@ -57,20 +54,73 @@ def test_evaluate_rejects_negative_year_high_pe_and_stale():
     assert evaluate_earnings(eps_series([1] * 5, start=2018), 5.0, c, today=TODAY)["status"] == "EPS data is stale"
 
 
-def test_current_ratio_prefers_latest_quarter():
+def test_balance_sheet_prefers_latest_quarter_and_falls_back_for_missing_rows():
     class T:
         quarterly_balance_sheet = pd.DataFrame(
-            {pd.Timestamp("2026-06-30"): [300.0, 100.0], pd.Timestamp("2026-03-31"): [100.0, 100.0]},
-            index=["Current Assets", "Current Liabilities"])
+            {pd.Timestamp("2026-06-30"): [300.0, 100.0, None, 50.0],
+             pd.Timestamp("2026-03-31"): [100.0, 100.0, 9.0, 40.0]},
+            index=["Current Assets", "Current Liabilities", "Ordinary Shares Number", "Net PPE"])
         balance_sheet = pd.DataFrame()
-    assert screener.get_current_ratio(T()) == (3.0, "2026-06-30")
+    bs = screener.get_balance_sheet(T())
+    assert bs == {"date": "2026-06-30", "current_assets": 300.0, "current_liabilities": 100.0,
+                  "shares": 9.0, "net_ppe": 50.0}
+
+
+def test_balance_sheet_none_without_current_items():
+    class T:
+        quarterly_balance_sheet = pd.DataFrame({pd.Timestamp("2026-06-30"): [1.0]}, index=["Total Assets"])
+        balance_sheet = pd.DataFrame()
+    assert screener.get_balance_sheet(T()) is None
+
+
+def test_annual_flows_uses_latest_year_and_positive_da():
+    inc = income_stmt({"Net Income Common Stockholders": [80.0, 100.0], "Reconciled Depreciation": [5.0, 6.0]})
+    cf = income_stmt({"Depreciation And Amortization": [-18.0, -20.0]})
+    assert screener.get_annual_flows(inc, cf) == {"net_income": 100.0, "da": 20.0}
+    assert screener.get_annual_flows(inc, None) == {"net_income": 100.0, "da": 6.0}
+
+
+def test_latest_share_count_picks_newest_instant_from_filings():
+    rows = [
+        {"end": "2024-12-31", "val": 900, "form": "10-K", "filed": "2025-02-10"},
+        {"end": "2025-12-31", "val": 1000, "form": "10-K", "filed": "2026-02-10"},
+        {"end": "2026-06-30", "val": 5, "form": "8-K", "filed": "2026-07-01"},          # not a 10-K/10-Q
+        {"start": "2025-01-01", "end": "2026-06-30", "val": 7, "form": "10-Q", "filed": "2026-08-01"},  # period
+    ]
+    facts = {"facts": {"us-gaap": {screener.OPTIONS_CONCEPT: {"units": {"shares": rows}}}}}
+    assert screener.latest_share_count(facts, screener.OPTIONS_CONCEPT, today=TODAY) == (1000.0, "2025-12-31")
+    assert screener.latest_share_count(facts, screener.OPTIONS_CONCEPT, today=date(2030, 1, 1)) == (None, None)
+    assert screener.latest_share_count(None, screener.OPTIONS_CONCEPT) == (None, None)
+
+
+def test_operating_metrics_follow_the_10_steps():
+    m = compute_operating_metrics(price=10.0, shares=900, current_assets=2_000, net_income=1_000, da=500,
+                                  net_ppe=5_000, options=60, stock_awards=40)
+    assert m["available_shares"] == 1_000                 # 900 + 60 + 40
+    assert m["paid_entire"] == 10_000                     # x price
+    assert m["paid_op"] == 8_000                          # - current assets
+    assert m["eba"] == 1_500                              # net income + D&A
+    assert m["balance"] == 1_400                          # - 5% of current assets
+    assert m["pct_before"] == pytest.approx(17.5)         # 1400 / 8000
+    assert m["est_life"] == 10                            # 5000 / 500
+    assert m["inv_amort"] == 800                          # 8000 / 10
+    assert m["after"] == 600                              # 1400 - 800
+    assert m["pct_after"] == pytest.approx(7.5)           # 600 / 8000
+
+
+def test_operating_metrics_handle_missing_and_negative_base():
+    m = compute_operating_metrics(price=10.0, shares=100, current_assets=2_000, net_income=100, da=50, net_ppe=500)
+    assert m["paid_op"] == -1_000 and math.isnan(m["pct_before"]) and math.isnan(m["pct_after"])
+    m = compute_operating_metrics(price=10.0, shares=1_000, current_assets=2_000, net_income=100, da=None,
+                                  net_ppe=500)
+    assert m["paid_op"] == 8_000 and math.isnan(m["pct_before"]) and math.isnan(m["est_life"])
 
 
 def test_run_screen_end_to_end(monkeypatch):
     universe = pd.DataFrame({
         "ticker": ["GOOD", "LOWCR", "LOSS", "PRICY", "SHORT", "BRK.B"],
         "name": ["Good", "LowCR", "Loss", "Pricy", "Short", "Berkshire"],
-        "sector": ["X"] * 6,
+        "sector": ["X"] * 6, "cik": range(1, 7),
     })
     universe["yf_ticker"] = universe["ticker"].str.replace(".", "-", regex=False)
     monkeypatch.setattr(screener, "get_sp500_constituents", lambda: universe)
@@ -80,17 +130,33 @@ def test_run_screen_end_to_end(monkeypatch):
     first = date.today().year - 4  # latest fiscal year = last calendar year
     eps = {"GOOD": [5] * 4, "LOWCR": [5] * 4, "LOSS": [5, -1, 5, 5], "PRICY": [5] * 4,
            "SHORT": [5] * 3, "BRK-B": [6] * 4}
-    monkeypatch.setattr(screener.yf, "Ticker", lambda t: t)
-    monkeypatch.setattr(screener, "get_annual_eps", lambda t: eps_series(eps[t], start=first + 4 - len(eps[t])))
-    cr = {"GOOD": (2.5, "2026-06-30"), "LOWCR": (1.5, "2026-06-30"), "BRK-B": (None, None)}
-    monkeypatch.setattr(screener, "get_current_ratio", lambda t: cr[t])
+    class FakeTicker:
+        def __init__(self, sym):
+            self.sym, self.income_stmt, self.cashflow = sym, sym, None
+    monkeypatch.setattr(screener.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(screener, "get_annual_eps",
+                        lambda stmt: eps_series(eps[stmt], start=first + 4 - len(eps[stmt])))
 
-    df, statuses = screener.run_screen(Criteria())
+    def bs(ca, cl):
+        return {"date": "2026-06-30", "current_assets": ca, "current_liabilities": cl,
+                "shares": 1_000.0, "net_ppe": 5_000.0}
+    sheets = {"GOOD": bs(2_500.0, 1_000.0), "LOWCR": bs(1_500.0, 1_000.0), "BRK-B": None}
+    monkeypatch.setattr(screener, "get_balance_sheet", lambda t: sheets[t.sym])
+    monkeypatch.setattr(screener, "get_annual_flows", lambda inc, cf: {"net_income": 4_000.0, "da": 500.0})
+    sec_calls = []
+    monkeypatch.setattr(screener, "fetch_company_facts", lambda cik, session: sec_calls.append(cik) or None)
+
+    df, statuses = screener.run_screen(Criteria(), "test test@example.com")
     assert df["Ticker"].tolist() == ["GOOD"]
     assert df["P/E"].iloc[0] == pytest.approx(10.0)
+    assert sec_calls == [1]  # SEC is only queried for selected stocks
+    good = df.iloc[0]
+    assert good["paid_op"] == pytest.approx(1_000 * 50 - 2_500)
+    assert good["pct_before"] == pytest.approx((4_500 - 125) / 47_500 * 100)
+    assert good["Notes"] == "no option/RSU data"
     assert statuses["LOWCR"].startswith("current ratio")
     assert statuses["LOSS"].startswith("negative")
     assert statuses["PRICY"].startswith("P/E")
     assert statuses["SHORT"].startswith("fewer than 4")
     assert statuses["BRK.B"].startswith("no current ratio")
-    screener.print_report(df, statuses, Criteria())
+    screener.print_report(df, statuses, Criteria(), details=True)
