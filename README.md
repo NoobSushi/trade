@@ -1,6 +1,8 @@
-# S&P 500 value screener
+# US large-cap value screener (S&P 500, Nasdaq-100, Dow)
 
-Lists S&P 500 stocks that meet all three rules:
+Screens the S&P 500, Nasdaq-100 and Dow Jones Industrial Average together. A stock that's in more than one index is screened once, and the `Index` column lists every index it belongs to. Use `--index` to screen only some of them.
+
+It lists the stocks that meet all three rules:
 
 1. **Profitable every year:** diluted EPS is above 0 in every fiscal year used.
 2. **P/E < 15:** P/E = current share price / average annual diluted EPS.
@@ -39,7 +41,8 @@ When an input is missing, the values that depend on it show `n/a`, and the `Note
 
 | Data | Source |
 |---|---|
-| S&P 500 members (ticker, name, sector, CIK) | Wikipedia |
+| Index members (ticker, name, sector) | Wikipedia (S&P 500, Nasdaq-100 and Dow pages). If one page fails to load, the run warns and continues with the others |
+| SEC company ID (CIK) for stocks whose Wikipedia page doesn't list it | SEC `company_tickers.json` |
 | Annual EPS (`Diluted EPS`, or `Basic EPS` if that's missing) | Yahoo Finance (`yfinance`, `Ticker.income_stmt`) |
 | Latest price | Yahoo Finance (`yfinance`), one batch download |
 | Balance sheet, cash flow | Yahoo Finance (`yfinance`), fetched only for stocks that pass the P/E rule |
@@ -54,6 +57,7 @@ pip install -r requirements.txt
 export SEC_USER_AGENT="Your Name you@example.com"
 python screener.py
 python screener.py --details                   # show every step of the indicators
+python screener.py --index sp500 dow           # only some indexes (sp500, nasdaq100, dow)
 
 # Options
 python screener.py --max-pe 12 --min-current-ratio 1.5

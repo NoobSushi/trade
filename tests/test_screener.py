@@ -133,7 +133,8 @@ def test_run_screen_end_to_end(monkeypatch):
         "sector": ["X"] * 6, "cik": range(1, 7),
     })
     universe["yf_ticker"] = universe["ticker"].str.replace(".", "-", regex=False)
-    monkeypatch.setattr(screener, "get_sp500_constituents", lambda: universe)
+    universe["member_of"] = "S&P 500"
+    monkeypatch.setattr(screener, "get_universe", lambda keys, session: universe)
     prices = pd.Series({"GOOD": 50.0, "LOWCR": 50.0, "LOSS": 50.0, "PRICY": 500.0, "SHORT": 10.0, "BRK-B": 60.0})
     monkeypatch.setattr(screener, "get_latest_prices", lambda t: prices)
 
@@ -164,9 +165,70 @@ def test_run_screen_end_to_end(monkeypatch):
     assert good["paid_op"] == pytest.approx(1_000 * 50 - 2_500)
     assert good["pct_before"] == pytest.approx((4_500 - 125) / 47_500 * 100)
     assert good["Notes"] == "no option/RSU data"
+    assert good["Index"] == "S&P 500"
     assert statuses["LOWCR"].startswith("current ratio")
     assert statuses["LOSS"].startswith("negative")
     assert statuses["PRICY"].startswith("P/E")
     assert statuses["SHORT"].startswith("fewer than 4")
     assert statuses["BRK.B"].startswith("no current ratio")
     screener.print_report(df, statuses, Criteria(), details=True)
+
+
+def html_table(header, rows, table_id="constituents"):
+    th = "".join(f"<th>{h}</th>" for h in header)
+    trs = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    return f'<html><body><table id="{table_id}"><tr>{th}</tr>{trs}</table></body></html>'
+
+
+SP500_HTML = html_table(["Symbol", "Security", "GICS Sector", "CIK"],
+                        [["AAPL", "Apple Inc.", "Information Technology", "320193"],
+                         ["BRK.B", "Berkshire Hathaway", "Financials", "1067983"]])
+NDX_HTML = html_table(["Company", "Ticker", "GICS Sector", "GICS Sub-Industry"],
+                      [["Apple Inc.", "AAPL", "Information Technology", "Hardware"],
+                       ["Lululemon", "LULU", "Consumer Discretionary", "Apparel"]])
+DOW_HTML = html_table(["Company", "Exchange", "Symbol", "Industry"],
+                      [["Apple Inc.", "NASDAQ", "AAPL", "Information technology"],
+                       ["Travelers", "NYSE", "TRV", "Insurance"]], table_id="other")
+
+
+def test_parse_constituents_handles_each_wikipedia_layout():
+    sp = screener.parse_constituents(SP500_HTML, "S&P 500")
+    assert sp["yf_ticker"].tolist() == ["AAPL", "BRK-B"] and sp["cik"].tolist() == [320193, 1067983]
+    ndx = screener.parse_constituents(NDX_HTML, "Nasdaq-100")
+    assert ndx["ticker"].tolist() == ["AAPL", "LULU"] and ndx["cik"].isna().all()
+    dow = screener.parse_constituents(DOW_HTML, "Dow")  # no id="constituents": falls back to any table
+    assert dow["ticker"].tolist() == ["AAPL", "TRV"] and dow["sector"].tolist()[1] == "Insurance"
+
+
+def test_get_universe_merges_duplicates_and_fills_ciks(monkeypatch):
+    pages = {screener.INDEXES["sp500"][1]: SP500_HTML, screener.INDEXES["nasdaq100"][1]: NDX_HTML,
+             screener.INDEXES["dow"][1]: DOW_HTML}
+
+    class Resp:
+        def __init__(self, text):
+            self.text = text
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr(screener.requests, "get", lambda url, **kw: Resp(pages[url]))
+    monkeypatch.setattr(screener, "fetch_sec_ciks", lambda session: {"LULU": 1397187, "TRV": 86312})
+
+    df = screener.get_universe(list(screener.INDEXES), session=None).set_index("ticker")
+    assert sorted(df.index) == ["AAPL", "BRK.B", "LULU", "TRV"]
+    assert df.loc["AAPL", "member_of"] == "S&P 500, Nasdaq-100, Dow"
+    assert df.loc["AAPL", "sector"] == "Information Technology"  # first index's value wins
+    assert df.loc["LULU", "cik"] == 1397187 and df.loc["TRV", "cik"] == 86312
+
+
+def test_get_universe_skips_an_index_that_fails(monkeypatch):
+    def get(url, **kw):
+        if "Nasdaq" in url:
+            raise screener.requests.ConnectionError("blocked")
+        class R:
+            text = DOW_HTML
+            def raise_for_status(self):
+                pass
+        return R()
+    monkeypatch.setattr(screener.requests, "get", get)
+    monkeypatch.setattr(screener, "fetch_sec_ciks", lambda session: {})
+    df = screener.get_universe(["nasdaq100", "dow"], session=None)
+    assert df["ticker"].tolist() == ["AAPL", "TRV"] and df["cik"].isna().all()

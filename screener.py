@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""S&P 500 value screener.
+"""US large-cap value screener (S&P 500, Nasdaq-100, Dow Jones Industrial Average).
 
-Selects S&P 500 stocks with:
+Selects stocks with:
   * positive diluted EPS in every fiscal year used (the last 5, or at least 4 if
     Yahoo has fewer),
   * P/E < max_pe, where P/E = current price / average diluted EPS of those years,
@@ -20,7 +20,8 @@ For each selected stock it also computes operating-investment indicators:
   % Earned After Amort.     = Earned After Amort. / Paid for Operating Property x 100
 
 Data sources:
-  * S&P 500 constituents (ticker, name, sector, CIK): Wikipedia.
+  * Index constituents (ticker, name, sector): Wikipedia. Stocks in several indexes are
+    screened once. CIKs missing from Wikipedia come from SEC's company_tickers.json.
   * Annual EPS, net income, D&A, current price, latest balance sheet: Yahoo Finance via yfinance.
   * Stock options outstanding and nonvested RSU/PSU counts: SEC EDGAR XBRL "companyfacts"
     (fetched only for selected stocks).
@@ -45,7 +46,17 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# Index key -> (display name, Wikipedia page with a "constituents" table).
+INDEXES = {
+    "sp500": ("S&P 500", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"),
+    "nasdaq100": ("Nasdaq-100", "https://en.wikipedia.org/wiki/Nasdaq-100"),
+    "dow": ("Dow", "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"),
+}
+# Column names differ between the Wikipedia tables; the first one present is used.
+TICKER_COLS = ("Symbol", "Ticker")
+NAME_COLS = ("Security", "Company")
+SECTOR_COLS = ("GICS Sector", "Industry", "Sector")
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 # Statement rows tried in order for each figure.
 EPS_ROWS = ("Diluted EPS", "Basic EPS")
@@ -66,24 +77,76 @@ MAX_STALENESS_DAYS = 550
 
 
 # --------------------------------------------------------------------------- #
-# S&P 500 constituents
+# Index constituents
 # --------------------------------------------------------------------------- #
-def get_sp500_constituents() -> pd.DataFrame:
-    """Return DataFrame with columns: ticker, yf_ticker, name, sector, cik."""
-    resp = requests.get(WIKI_SP500_URL, headers={"User-Agent": "Mozilla/5.0 (sp500-screener)"}, timeout=30)
-    resp.raise_for_status()
-    table = pd.read_html(io.StringIO(resp.text), attrs={"id": "constituents"})[0]
-    df = pd.DataFrame(
-        {
-            "ticker": table["Symbol"].astype(str).str.strip(),
-            "name": table["Security"],
-            "sector": table["GICS Sector"],
-            "cik": table["CIK"].astype(int),
-        }
-    )
+def _first_col(table: pd.DataFrame, names: tuple[str, ...]) -> str | None:
+    return next((c for c in names if c in table.columns), None)
+
+
+def parse_constituents(html: str, index_name: str) -> pd.DataFrame:
+    """Parse a Wikipedia constituents table into: ticker, yf_ticker, name, sector, cik, member_of."""
+    try:
+        tables = pd.read_html(io.StringIO(html), attrs={"id": "constituents"}, flavor="lxml")
+    except ValueError:  # no table with that id: fall back to any table with a ticker column
+        tables = pd.read_html(io.StringIO(html), flavor="lxml")
+    table = next((t for t in tables if _first_col(t, TICKER_COLS) and _first_col(t, NAME_COLS)), None)
+    if table is None:
+        raise ValueError(f"no constituents table found for {index_name}")
+    sector_col = _first_col(table, SECTOR_COLS)
+    df = pd.DataFrame({
+        "ticker": table[_first_col(table, TICKER_COLS)].astype(str).str.strip(),
+        "name": table[_first_col(table, NAME_COLS)],
+        "sector": table[sector_col] if sector_col else None,
+        "cik": pd.to_numeric(table["CIK"], errors="coerce") if "CIK" in table.columns else float("nan"),
+        "member_of": index_name,
+    })
     # Yahoo uses '-' for share classes (BRK.B -> BRK-B).
     df["yf_ticker"] = df["ticker"].str.replace(".", "-", regex=False)
-    return df.reset_index(drop=True)
+    return df
+
+
+def combine_constituents(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Merge index lists: one row per stock, with every index it belongs to."""
+    df = pd.concat(frames, ignore_index=True)
+    first = lambda col: col.dropna().iloc[0] if col.notna().any() else None  # noqa: E731
+    merged = df.groupby("yf_ticker", sort=False).agg(
+        ticker=("ticker", "first"), name=("name", first), sector=("sector", first), cik=("cik", first),
+        member_of=("member_of", lambda col: ", ".join(dict.fromkeys(col))),
+    ).reset_index()
+    return merged[["ticker", "yf_ticker", "name", "sector", "cik", "member_of"]]
+
+
+def fetch_sec_ciks(session: requests.Session) -> dict[str, int]:
+    """Ticker (Yahoo style, e.g. BRK-B) -> CIK from SEC's company_tickers.json."""
+    resp = session.get(SEC_TICKERS_URL, timeout=30)
+    resp.raise_for_status()
+    return {str(v["ticker"]).upper().replace(".", "-"): int(v["cik_str"]) for v in resp.json().values()}
+
+
+def get_universe(index_keys: list[str], session: requests.Session) -> pd.DataFrame:
+    """Constituents of the chosen indexes, de-duplicated, with CIKs filled in where missing."""
+    frames = []
+    for key in index_keys:
+        name, url = INDEXES[key]
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (stock-screener)"}, timeout=30)
+            resp.raise_for_status()
+            frames.append(parse_constituents(resp.text, name))
+            log(f"  {name}: {len(frames[-1])} stocks")
+        except Exception as exc:  # keep going with the other indexes
+            log(f"  WARNING: could not load {name} constituents ({exc})")
+    if not frames:
+        raise RuntimeError("could not load any index constituents")
+    df = combine_constituents(frames)
+    missing = df["cik"].isna()
+    if missing.any():
+        try:
+            ciks = fetch_sec_ciks(session)
+            df.loc[missing, "cik"] = df.loc[missing, "yf_ticker"].str.upper().map(ciks)
+        except Exception as exc:
+            log(f"  WARNING: could not load SEC ticker-to-CIK map ({exc})")
+    df["cik"] = df["cik"].astype("Int64")
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -282,13 +345,15 @@ def evaluate_earnings(eps_annual: pd.Series, price: float, criteria: Criteria,
 
 
 def run_screen(criteria: Criteria, user_agent: str, tickers: list[str] | None = None,
-               workers: int = 4) -> tuple[pd.DataFrame, pd.Series]:
-    log("Loading S&P 500 constituents from Wikipedia...")
-    universe = get_sp500_constituents()
+               workers: int = 4, index_keys: list[str] | None = None) -> tuple[pd.DataFrame, pd.Series]:
+    session = requests.Session()
+    session.headers.update({"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
+    log("Loading index constituents from Wikipedia...")
+    universe = get_universe(index_keys or list(INDEXES), session)
     if tickers:
         wanted = {t.upper() for t in tickers}
         universe = universe[universe["ticker"].isin(wanted) | universe["yf_ticker"].isin(wanted)]
-    log(f"  {len(universe)} companies")
+    log(f"  {len(universe)} unique companies")
 
     log("Downloading latest prices from Yahoo Finance...")
     prices = get_latest_prices(universe["yf_ticker"].tolist())
@@ -337,11 +402,10 @@ def run_screen(criteria: Criteria, user_agent: str, tickers: list[str] | None = 
         selected.append((row, price, res, cr, bs, flows))
 
     log(f"Downloading option / RSU counts from SEC EDGAR ({len(selected)} stocks)...")
-    session = requests.Session()
-    session.headers.update({"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
     results = []
     for row, price, res, cr, bs, flows in selected:
-        dil = get_dilution(fetch_company_facts(row.cik, session))
+        facts = fetch_company_facts(int(row.cik), session) if pd.notna(row.cik) else None
+        dil = get_dilution(facts)
         m = compute_operating_metrics(price, bs["shares"], bs["current_assets"], flows["net_income"],
                                       flows["da"], bs["net_ppe"], dil["options"], dil["stock_awards"],
                                       dil["dsu"], dil["exchangeable"])
@@ -358,6 +422,7 @@ def run_screen(criteria: Criteria, user_agent: str, tickers: list[str] | None = 
             "Ticker": row.ticker,
             "Company": row.name,
             "Sector": row.sector,
+            "Index": row.member_of,
             "Price": price,
             "Avg EPS": res["avg_eps"],
             "P/E": res["pe"],
@@ -390,7 +455,7 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-SCREEN_COLS = ["Ticker", "Company", "Sector", "Price", "Avg EPS", "P/E", "Current Ratio", "Yrs", "EPS Years"]
+SCREEN_COLS = ["Ticker", "Company", "Sector", "Index", "Price", "Avg EPS", "P/E", "Current Ratio", "Yrs", "EPS Years"]
 
 DETAIL_ROWS = [
     ("common_shares", "Common shares", "shares"),
@@ -436,9 +501,11 @@ def operating_table(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def print_report(df: pd.DataFrame, statuses: pd.Series, criteria: Criteria, details: bool = False) -> None:
+def print_report(df: pd.DataFrame, statuses: pd.Series, criteria: Criteria, details: bool = False,
+                 index_keys: list[str] | None = None) -> None:
+    names = ", ".join(INDEXES[k][0] for k in (index_keys or INDEXES))
     print()
-    print(f"S&P 500 screen  |  {datetime.now():%Y-%m-%d %H:%M}")
+    print(f"Stock screen ({names})  |  {datetime.now():%Y-%m-%d %H:%M}")
     print(f"Rules: EPS > 0 in each of the last {criteria.years} fiscal years "
           f"(at least {criteria.min_years} required), "
           f"P/E (price / avg EPS) < {criteria.max_pe:g}, "
@@ -472,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-current-ratio", type=float, default=2.0, help="minimum current ratio (default 2)")
     p.add_argument("--years", type=int, default=5, help="max fiscal years of EPS to average (default 5)")
     p.add_argument("--min-years", type=int, default=4, help="min fiscal years of EPS required (default 4)")
+    p.add_argument("--index", nargs="+", choices=list(INDEXES), default=list(INDEXES), dest="indexes",
+                   help="indexes to screen (default: all of %(choices)s)")
     p.add_argument("--tickers", nargs="+", help="only screen these tickers (for quick tests)")
     p.add_argument("--details", action="store_true", help="show every step of the indicator calculations")
     p.add_argument("--user-agent", default=os.environ.get("SEC_USER_AGENT"),
@@ -485,8 +554,8 @@ def main(argv: list[str] | None = None) -> int:
 
     criteria = Criteria(max_pe=args.max_pe, min_current_ratio=args.min_current_ratio,
                         years=args.years, min_years=args.min_years)
-    df, statuses = run_screen(criteria, args.user_agent, args.tickers)
-    print_report(df, statuses, criteria, details=args.details)
+    df, statuses = run_screen(criteria, args.user_agent, args.tickers, index_keys=args.indexes)
+    print_report(df, statuses, criteria, details=args.details, index_keys=args.indexes)
     return 0
 
 
